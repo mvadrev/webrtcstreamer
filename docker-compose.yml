@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  sender:
+    build:
+      context: ./sender
+    container_name: sender-container
+    volumes:
+      - ./sender:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - receiver
+    networks:
+      - video_network
+    command: python3 sender.py
+    restart: always
+
+  receiver:
+    build:
+      context: ./receiver
+    container_name: receiver-container
+    runtime: nvidia  # Ensure the container uses NVIDIA GPUs
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all  # This will use all available GPUs
+    volumes:
+      - ./receiver:/app
+    networks:
+      - video_network
+    command: python3 receiver.py
+    restart: always
+
+networks:
+  video_network:
+    driver: bridge
