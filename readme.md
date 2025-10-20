@@ -12,3 +12,5 @@ $ sudo apt-get install libgstreamer1.0-dev \
 $ sudo apt-get install gstreamer1.0-qt5
 # install if you want to work with audio
 $ sudo apt-get install gstreamer1.0-pulseaudio
+
+gst-launch-1.0 videotestsrc ! videoconvert ! autovideosink
