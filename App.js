@@ -1,101 +1,99 @@
 import React, { useRef, useState } from "react";
 
 function App() {
-  const videoRef = useRef(null);
-  const pcRef = useRef(null);
+  const yoloVideoRef = useRef(null);
+  const piVideoRef = useRef(null);
+  const yoloPcRef = useRef(null);
+  const piPcRef = useRef(null);
   const [streaming, setStreaming] = useState(false);
-  const [showYoloStream, setShowYoloStream] = useState(false);
 
-  async function startStream() {
-    // Start the backend stream (your backend server must be running)
-    await fetch("http://192.168.4.152:5000/start_stream", { method: "POST" });
+  // YOLO WebRTC stream
+async function startYoloStream() {
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }],
+  });
+  yoloPcRef.current = pc;
 
+  pc.ontrack = (event) => {
+    console.log("✅ Track received from YOLO:", event.streams[0]);
+    if (yoloVideoRef.current) {
+      yoloVideoRef.current.srcObject = event.streams[0];
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    console.log("ICE state:", pc.iceConnectionState);
+  };
+
+  pc.addTransceiver("video", { direction: "recvonly" });
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+
+  console.log("📤 Sending offer to YOLO server...");
+  const response = await fetch("http://localhost:8000/offer", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+  });
+
+  const answer = await response.json();
+  console.log("📥 Received answer from YOLO server.");
+  await pc.setRemoteDescription(answer);
+}
+
+
+  // Pi WebRTC stream
+  async function startPiStream() {
     const pc = new RTCPeerConnection();
-    pcRef.current = pc;
-
-    pc.addTransceiver("video", { direction: "recvonly" });
+    piPcRef.current = pc;
 
     pc.ontrack = (event) => {
-      if (videoRef.current) {
-        videoRef.current.srcObject = event.streams[0];
+      if (piVideoRef.current) {
+        piVideoRef.current.srcObject = event.streams[0];
       }
     };
-
-    pc.onicecandidate = async (event) => {
-      if (!event.candidate) {
-        const offer = pc.localDescription;
-        const response = await fetch("http://192.168.4.152:5000/offer", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
-        });
-        const answer = await response.json();
-        await pc.setRemoteDescription(answer);
-
-        // Now that WebRTC connection is established, show YOLO stream
-        setShowYoloStream(true);
-      }
-    };
-
+    pc.addTransceiver("video", { direction: "recvonly" });
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
+
+    const response = await fetch("http://192.168.4.117:5000/offer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+    });
+
+    const answer = await response.json();
+    await pc.setRemoteDescription(answer);
+  }
+
+  async function startStream() {
+    await startPiStream();
+    await startYoloStream();
     setStreaming(true);
   }
 
   async function stopStream() {
-    await fetch("http://192.168.4.152:5000/stop_stream", { method: "POST" });
-    if (pcRef.current) {
-      pcRef.current.close();
-      pcRef.current = null;
-    }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
+    if (yoloPcRef.current) yoloPcRef.current.close();
+    if (piPcRef.current) piPcRef.current.close();
+    if (yoloVideoRef.current) yoloVideoRef.current.srcObject = null;
+    if (piVideoRef.current) piVideoRef.current.srcObject = null;
     setStreaming(false);
-    setShowYoloStream(false);
   }
 
   return (
     <div>
-      <h1>📷 Raspberry Pi WebRTC Camera</h1>
-
-      <div style={{ display: "flex", gap: "20px" }}>
-        {/* Raw WebRTC Stream */}
+      <h1>📷 YOLO & Pi WebRTC Streams</h1>
+      <div style={{ display: "flex", gap: "10px" }}>
         <div>
-          <h2>Original Stream</h2>
-          <video
-            ref={videoRef}
-            autoPlay
-            playsInline
-            muted
-            style={{
-              width: "640px",
-              height: "480px",
-              border: "2px solid black",
-            }}
-          />
+          <h3>Pi Camera</h3>
+          <video ref={piVideoRef} autoPlay playsInline muted width={320} height={240} />
         </div>
-
-        {/* YOLO Detection Stream */}
         <div>
-          <h2>YOLO Detection Stream</h2>
-          {showYoloStream ? (
-            <img
-              src="http://localhost:8000/video_feed"
-              alt="YOLO Stream"
-              style={{
-                width: "640px",
-                height: "480px",
-                border: "2px solid green",
-                objectFit: "cover",
-              }}
-            />
-          ) : (
-            <p>Start stream to view YOLO detection</p>
-          )}
+          <h3>YOLO Processed</h3>
+          <video ref={yoloVideoRef} autoPlay playsInline muted width={320} height={240} />
         </div>
       </div>
-
       <div style={{ marginTop: 10 }}>
         {!streaming ? (
           <button onClick={startStream}>Start Stream</button>
