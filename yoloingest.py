@@ -1,177 +1,211 @@
 import asyncio
 import cv2
-import io
-import aiohttp
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+import numpy as np
+import torch
+from aiortc import RTCPeerConnection, VideoStreamTrack, RTCSessionDescription, RTCConfiguration, RTCIceServer, RTCRtpSender
+from aiortc.mediastreams import MediaStreamError
+from quart import Quart, request, jsonify
+from quart_cors import cors
+import av
 from ultralytics import YOLO
-from quart import Quart, jsonify, Response
-from PIL import Image
 from hypercorn.asyncio import serve
 from hypercorn.config import Config
-from quart_cors import cors  # Added for CORS support
-
-# Load YOLO model
-model = YOLO('yolov8n.pt')
+import aiohttp
 
 app = Quart(__name__)
-app = cors(app, allow_origin="*")  # Enable CORS
+app = cors(app, allow_origin="*")
 
-detections = []
-current_frame = None  # Holds latest processed frame for MJPEG streaming
+# ----------------------------
+# Globals
+# ----------------------------
+latest_raw_frame = None
+latest_processed_frame = None
+frame_lock = asyncio.Lock()
 
-class VideoTrackReceiver(VideoStreamTrack):
-    def __init__(self, track):
-        super().__init__()
-        self.track = track
-        self.frame_counter = 0
+FRAME_WIDTH, FRAME_HEIGHT = 640, 480
+blank_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+cv2.putText(blank_frame, "Waiting for YOLO...", (50, FRAME_HEIGHT // 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
+# ----------------------------
+# CUDA check and YOLO model
+# ----------------------------
+cuda_available = torch.cuda.is_available()
+device = 'cuda' if cuda_available else 'cpu'
+print("Hello world from YOLO Ingest!")
+print(f"🌟 CUDA Available: {cuda_available}, Using device: {device}")
+
+model = YOLO("yolov8n.pt")
+model.to(device)
+print("✅ YOLO model loaded")
+
+# ----------------------------
+# ICE config for remote connectivity
+# ----------------------------
+ice_config = RTCConfiguration(
+    iceServers=[
+        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+        RTCIceServer(
+            urls=["turn:global.relay.metered.ca:80"],
+            username="openai",
+            credential="openai"
+        )
+    ]
+)
+
+# ----------------------------
+# YOLO Worker
+# ----------------------------
+async def yolo_worker():
+    global latest_raw_frame, latest_processed_frame
+    print("🎯 YOLO worker started")
+    frame_count = 0
+    while True:
+        frame_to_process = None
+        async with frame_lock:
+            if latest_raw_frame is not None:
+                frame_to_process = latest_raw_frame
+                latest_raw_frame = None
+
+        if frame_to_process is not None:
+            print(f"🖼️ Processing frame {frame_count}")
+            with torch.inference_mode():
+                results = await asyncio.to_thread(model.predict, frame_to_process, device=device, verbose=False)
+
+            img = frame_to_process.copy()  # keep original shape
+            for det in results[0].boxes:
+                x1, y1, x2, y2 = map(int, det.xyxy[0])
+                cls_id = int(det.cls[0])
+                conf = float(det.conf[0])
+                label = f"{model.names[cls_id]} {conf:.2f}"
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(img, label, (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+
+            async with frame_lock:
+                latest_processed_frame = img
+            print(f"✅ Frame {frame_count} processed")
+            frame_count += 1
+        else:
+            await asyncio.sleep(0.005)
+
+# ----------------------------
+# WebRTC Track for React
+# ----------------------------
+class YOLOProcessedTrack(VideoStreamTrack):
     async def recv(self):
-        global detections, current_frame
+        pts, time_base = await self.next_timestamp()
+        await asyncio.sleep(1/30)  # ~30 FPS for Docker
 
-        frame = await self.track.recv()
-        self.frame_counter += 1
+        async with frame_lock:
+            img = latest_processed_frame.copy() if latest_processed_frame is not None else blank_frame
 
-        img = frame.to_ndarray(format="bgr24")
-
-        # Resize for YOLO input & display
-        target_width = 640
-        scale = target_width / img.shape[1]
-        target_height = int(img.shape[0] * scale)
-        img_resized = cv2.resize(img, (target_width, target_height))
-
-        # Run YOLO every 2 frames to reduce load
-        if self.frame_counter % 2 == 0:
-            results = model(img_resized, verbose=False)
-            detections.clear()
-
-            boxes = results[0].boxes.xyxy.cpu().numpy()
-            scores = results[0].boxes.conf.cpu().numpy()
-            classes = results[0].boxes.cls.cpu().numpy().astype(int)
-
-            for box, score, cls in zip(boxes, scores, classes):
-                x1, y1, x2, y2 = box.astype(int)
-                label = f"{model.names[cls]} {score:.2f}"
-                detections.append({
-                    "label": model.names[cls],
-                    "confidence": float(score),
-                    "box": [x1, y1, x2, y2]
-                })
-
-                # Draw detection box + label
-                cv2.rectangle(img_resized, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-                cv2.rectangle(img_resized, (x1, y1 - 20), (x1 + w, y1), (0, 255, 0), -1)
-                cv2.putText(img_resized, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-
-        current_frame = img_resized  # Save frame for MJPEG stream
-
+        frame = av.VideoFrame.from_ndarray(img, format="bgr24")
+        frame.pts = pts
+        frame.time_base = time_base
+        print(f"📡 Sending frame to client")
         return frame
 
-async def display_frames(track):
-    receiver = VideoTrackReceiver(track)
-    try:
-        while True:
-            await receiver.recv()
-    except asyncio.CancelledError:
-        print("Stopped display task")
+# ----------------------------
+# Connect to Pi
+# ----------------------------
+async def connect_to_pi():
+    global latest_raw_frame
+    while True:
+        print("🔌 Connecting to Pi...")
+        pc = RTCPeerConnection(configuration=ice_config)
 
-async def run_webrtc():
-    async with aiohttp.ClientSession() as session:
-        start_resp = await session.post("http://raspberrypi.local:5000/start_stream")
-        if start_resp.status != 200:
-            print("Failed to start stream:", await start_resp.text())
-            return
-        print("Stream started.")
+        @pc.on("track")
+        async def on_track(track):
+            global latest_raw_frame
+            print("✅ Pi video track received")
+            frame_count = 0
+            try:
+                while True:
+                    frame = await track.recv()
+                    img = frame.to_ndarray(format="bgr24")
+                    async with frame_lock:
+                        latest_raw_frame = img
+                    frame_count += 1
+                    if frame_count % 10 == 0:
+                        print(f"🎥 Received {frame_count} frames from Pi")
+            except MediaStreamError:
+                print("⚠️ Stream ended")
+            except Exception as e:
+                print(f"⚠️ Track error: {e}")
+            finally:
+                await pc.close()
+                print("🔁 Reconnecting in 5s...")
 
-    pc = RTCPeerConnection()
-    pc.addTransceiver("video", direction="recvonly")
-
-    display_task = None
-
-    @pc.on("track")
-    def on_track(track):
-        print(f"Track received: {track.kind}")
-        if track.kind == "video":
-            nonlocal display_task
-            display_task = asyncio.create_task(display_frames(track))
-
-    offer = await pc.createOffer()
-    await pc.setLocalDescription(offer)
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            "http://raspberrypi.local:5000/offer",
-            json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-        ) as resp:
-            if resp.status != 200:
-                print("Offer failed:", await resp.text())
-                return
-            answer_json = await resp.json()
-
-    answer = RTCSessionDescription(sdp=answer_json["sdp"], type=answer_json["type"])
-    await pc.setRemoteDescription(answer)
-
-    print("WebRTC connected.")
-
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except asyncio.CancelledError:
-        if display_task:
-            display_task.cancel()
-
-@app.route("/detections")
-async def get_detections():
-    return jsonify(detections)
-
-@app.route("/video_feed")
-async def video_feed():
-    async def generate():
-        global current_frame
-        frame_counter = 0
-        print("Client connected to /video_feed")
         try:
-            while True:
-                if current_frame is not None:
-                    img_rgb = cv2.cvtColor(current_frame, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(img_rgb)
-                    buf = io.BytesIO()
-                    pil_img.save(buf, format="JPEG")
-                    frame_bytes = buf.getvalue()
-                    yield (
-                        b"--frame\r\n"
-                        b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n"
-                    )
-                else:
-                    # No frame yet, send a heartbeat comment
-                    yield b"--frame\r\nContent-Type: text/plain\r\n\r\n.\r\n"
-                frame_counter += 1
-                if frame_counter % 40 == 0:
-                    # Periodic heartbeat to keep connection alive
-                    yield b"--frame\r\nContent-Type: text/plain\r\n\r\n.\r\n"
-                await asyncio.sleep(0.05)
-        except asyncio.CancelledError:
-            print("Client disconnected from video_feed")
+            pc.addTransceiver("video", direction="recvonly")
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "http://192.168.4.117:5000/offer",
+                    json={"sdp": pc.localDescription.sdp,
+                          "type": pc.localDescription.type},
+                ) as resp:
+                    answer = await resp.json()
+
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=answer["sdp"], type=answer["type"])
+            )
+            print("✅ Connected to Pi")
+            break
         except Exception as e:
-            print(f"Exception in video_feed generator: {e}")
+            print(f"❌ Failed to connect: {e}")
+            await pc.close()
+            await asyncio.sleep(5)
 
-    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+# ----------------------------
+# Offer endpoint for React client
+# ----------------------------
+@app.route("/offer", methods=["POST"])
+async def offer():
+    print("🌐 React client connected — generating WebRTC answer...")
+    params = await request.get_json()
+    pc = RTCPeerConnection(configuration=ice_config)
 
+    @pc.on("connectionstatechange")
+    async def on_state_change():
+        print("🔁 Connection state:", pc.connectionState)
 
+    @pc.on("iceconnectionstatechange")
+    async def on_ice_state_change():
+        print("❄️ ICE state:", pc.iceConnectionState)
+
+    pc.addTrack(YOLOProcessedTrack())
+
+    # Force VP8 codec
+    for transceiver in pc.getTransceivers():
+        if transceiver.kind == "video":
+            transceiver.setCodecPreferences(
+                [c for c in RTCRtpSender.getCapabilities("video").codecs
+                 if c.mimeType == "video/VP8"]
+            )
+
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    print("📞 Offer received from React client, answer sent (with VP8 codec)")
+    return jsonify({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+
+# ----------------------------
+# Main entry
+# ----------------------------
 async def main():
+    asyncio.create_task(connect_to_pi())
+    asyncio.create_task(yolo_worker())
+
     config = Config()
     config.bind = ["0.0.0.0:8000"]
-
-    quart_task = asyncio.create_task(serve(app, config))
-    webrtc_task = asyncio.create_task(run_webrtc())
-
-    try:
-        await asyncio.gather(quart_task, webrtc_task)
-    except asyncio.CancelledError:
-        print("Shutting down")
+    print("🚀 Server starting on 0.0.0.0:8000")
+    await serve(app, config)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Exiting...")
+    asyncio.run(main())
